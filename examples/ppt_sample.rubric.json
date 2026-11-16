@@ -1,0 +1,52 @@
+{
+  "title": "示例PPT操作题（宽屏自适应与切换排练）",
+  "kind": "ppt",
+  "rules": [
+    {
+      "id": "p1",
+      "name": "幻灯片设为宽屏16:9（960x540pt）且页数为5",
+      "points": 4,
+      "type": "ppt_page_setup",
+      "params": {
+        "slide_size": 7,
+        "width_pt": 960.0,
+        "height_pt": 540.0,
+        "slides_count": 5
+      }
+    },
+    {
+      "id": "p2",
+      "name": "母版应用图片背景且全页跟随母版背景",
+      "points": 4,
+      "type": "ppt_master_background",
+      "params": {
+        "master_fill_type": 6,
+        "all_follow_master": true
+      }
+    },
+    {
+      "id": "p3",
+      "name": "第2页文本框顶端对齐且横向均匀分布",
+      "points": 6,
+      "type": "ppt_align_distribute",
+      "params": {
+        "slide": 2,
+        "shape_type": 1,
+        "top_aligned": true,
+        "h_distributed": true
+      }
+    },
+    {
+      "id": "p4",
+      "name": "全部幻灯片页面卷曲切换且排练计时3~10秒",
+      "points": 6,
+      "type": "ppt_slide_transition",
+      "params": {
+        "slides": "all",
+        "entry_effect": 3948,
+        "advance_on_time": true,
+        "advance_time_range": [3.0, 10.0]
+      }
+    }
+  ]
+}

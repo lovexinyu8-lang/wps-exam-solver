@@ -5,4 +5,7 @@ __pycache__/
 venv/
 ~$*
 *.tmp
+*.bak.*
+*.ooxml.tmp
 .DS_Store
+Thumbs.db
