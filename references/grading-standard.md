@@ -27,12 +27,13 @@
 
 ### 方式 A：单题自检（无参考答案时，由 `check.py` 实例化 `AuditSuite`）
 ```python
-import sys
+import os, sys
 from pathlib import Path
-sys.path.insert(0, str(next(
-    p / "scripts" for p in (Path.cwd() / ".agents/skills/wps-exam-solver", Path.home() / ".agents/skills/wps-exam-solver")
-    if (p / "scripts").is_dir()
-)))
+_candidates = [
+    *( [Path(os.environ["WPS_EXAM_SOLVER_HOME"])] if os.environ.get("WPS_EXAM_SOLVER_HOME") else [] ),
+    *(b / r for b in (Path.cwd(), Path.home()) for r in (".agents/skills/wps-exam-solver", ".claude/skills/wps-exam-solver", ".codex/skills/wps-exam-solver")),
+]
+sys.path.insert(0, str(next(p / "scripts" for p in _candidates if (p / "scripts").is_dir())))
 from wps_env import wps_session
 from ooxml_patch import audit_ooxml
 from ref_diff import AuditSuite
@@ -52,34 +53,31 @@ assert suite.all_passed
 # 双轨对比（COM + OOXML），返回退出码 0（全通过）或 1（存在差异）
 python scripts/ref_diff.py <作答文件> <参考答案>
 
-# 输出结构化 JSON 供脚本/评测前端消费
+# 输出结构化 JSON 供脚本/评测前端消费（含 location / expected / actual / hint）
 python scripts/ref_diff.py <作答文件> <参考答案> --json
 
-# 仅跑纯 OOXML 维度对比（跳过文本/计算值/版式等 COM 维，无需安装 WPS，毫秒级）
+# 纯 OOXML + openpyxl 静态对比（无需安装 WPS，毫秒级）
 python scripts/ref_diff.py <作答文件> <参考答案> --no-com
 ```
-### 方式 C：无参考答案时的 JSON 分值规则判分与批改（培训软件平替核心）
+
+### 方式 C：JSON 分值规则判分、自动出规则与批量阅卷
 ```bash
 # 1) 按 JSON 规则文件打分（支持单文件分点计分）
 python scripts/rubric_grader.py grade <作答文件> examples/ppt_sample.rubric.json
 
-# 2) 从已有参考答案提取基础 JSON 评分规则骨架（需 WPS COM，自动生成最多 10 类结构/XML 规则）
+# 2) 从已有参考答案提取 JSON 评分规则骨架（支持 COM 与 --no-com 静态抽取）
 python scripts/rubric_grader.py init <参考答案> -o my_exam.rubric.json --total-points 20
+python scripts/rubric_grader.py init <参考答案> -o my_exam.rubric.json --no-com
 
-# 3) 整套模考目录批量自动判分（自动匹配 *.rubric.json 或 参考答案目录）
-python scripts/rubric_grader.py batch <作答目录> <参考答案或规则目录> --json
+# 3) 整班/整套模考批量自动判分（支持：目录镜像、全班对单份参考答案/规则文件），并可导出 CSV/XLSX
+python scripts/rubric_grader.py batch <作答目录> <参考答案或规则文件/目录> --export report.xlsx
 ```
 
-#### 支持的 `rubric.json` 检查类型（`type`）速查（共 23 类，标注 `--no-com` 兼容度）
-- **Word (9)**：
-  - 纯 XML（支持 `--no-com`）：`word_numbering_xml`、`word_effects_xml`
-  - 混合（`--no-com` 仅核 XML 子项）：`word_page_setup`、`word_header_watermark`、`word_table`、`word_chart`
-  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`word_style`、`word_paragraph_match`、`word_text_absent`
-- **Excel (7)**：
-  - 纯 XML（支持 `--no-com`）：`excel_sheets`、`excel_sort_state`
-  - 混合（`--no-com` 仅核 XML 子项）：`excel_conditional_formatting`、`excel_pivot_table`
-  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`excel_range_formula`、`excel_range_values`、`excel_number_format`
-- **PPT (7)**：
-  - 纯 XML（支持 `--no-com`）：`ppt_print_options`
-  - 混合（`--no-com` 仅核 XML 子项）：`ppt_page_setup`、`ppt_shape_match`、`ppt_chart`
-  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`ppt_master_background`、`ppt_slide_transition`、`ppt_align_distribute`
+#### 支持的 `rubric.json` 检查类型（`type`）速查（共 23 类，全部提供 OOXML/`openpyxl` `--no-com` 实现）
+- **Word (9)**：`word_page_setup`、`word_style`、`word_paragraph_match`、`word_text_absent`、`word_header_watermark`、`word_numbering_xml`、`word_table`、`word_effects_xml`、`word_chart`
+- **Excel (7)**：`excel_sheets`、`excel_range_formula`、`excel_range_values`、`excel_number_format`、`excel_conditional_formatting`、`excel_sort_state`、`excel_pivot_table`
+- **PPT (7)**：`ppt_page_setup`、`ppt_print_options`、`ppt_master_background`、`ppt_slide_transition`、`ppt_shape_match`、`ppt_align_distribute`、`ppt_chart`
+
+> **两条已知边界提示**：
+> 1. 在 `--no-com` 纯静态模式下，`excel_range_values` 依赖工作簿内保存的 XML 缓存值（若公式未在 WPS/Excel 中保存计算缓存会提示 `cached value missing`），Word 动态分页/渲染编号文本（`page_number`、`ListString` 动态计算）仍以 WPS COM 模式为准。
+> 2. 旧版二进制 OLE2 文件（`.doc` / `.xls` / `.wps` / `.et` 非 ZIP 容器）无 OOXML 结构，必须移除 `--no-com` 走 WPS COM 核验。

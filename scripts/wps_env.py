@@ -5,12 +5,15 @@ from __future__ import annotations
 import gc
 import json
 import os
+import queue
 import shutil
+import threading
 import time
 import zipfile
+from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
 try:
     import winreg
@@ -18,11 +21,15 @@ except ImportError:  # pragma: no cover - Windows-only module
     winreg = None  # type: ignore
 
 try:
+    import pythoncom
     import win32api
     import win32com.client.dynamic as dyn
 except ImportError:  # pragma: no cover
+    pythoncom = None  # type: ignore
     win32api = None  # type: ignore
     dyn = None  # type: ignore
+
+T = TypeVar("T")
 
 PROGID_CANDIDATES: dict[str, tuple[str, ...]] = {
     "word": ("Kwps.Application", "KWPS.Application", "KWPS.Application.9", "WPS.Application"),
@@ -284,6 +291,169 @@ def _set_quiet(app: Any, kind: str, visible: bool | None, alerts: bool) -> dict[
 
 
 @contextmanager
+def com_thread_scope() -> Iterator[None]:
+    """Initialize and uninitialize COM STA on the calling thread safely."""
+    if pythoncom is None:
+        yield
+        return
+    initialized = False
+    try:
+        pythoncom.CoInitialize()
+        initialized = True
+    except Exception as exc:
+        # RPC_E_CHANGED_MODE (-2147417850): COM already initialized on this thread in another mode.
+        hres = exc.args[0] if getattr(exc, "args", None) else None
+        if hres != -2147417850:
+            raise
+    try:
+        yield
+    finally:
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _open_com_document(app: Any, kind: str, abs_path: str, *, read_only: bool, with_window: bool) -> Any:
+    if kind == "word":
+        return app.Documents.Open(abs_path, ReadOnly=read_only)
+    if kind == "excel":
+        return app.Workbooks.Open(abs_path, ReadOnly=read_only)
+    if kind == "ppt":
+        return app.Presentations.Open(
+            abs_path,
+            ReadOnly=-1 if read_only else 0,
+            Untitled=0,
+            WithWindow=-1 if with_window else 0,
+        )
+    raise ValueError(f"Unknown kind: {kind!r}")
+
+
+def _close_com_document(doc_obj: Any, kind: str) -> None:
+    if doc_obj is None:
+        return
+    try:
+        if kind in ("word", "excel"):
+            doc_obj.Close(SaveChanges=False)
+        else:
+            doc_obj.Close()
+    except Exception:
+        pass
+
+
+class WPSBatchSession:
+    """Reusable single-kind WPS COM host session to avoid cold-starting WPS per file."""
+
+    def __init__(
+        self,
+        app: Any,
+        kind: str,
+        progid: str,
+        pre_count: int,
+        *,
+        with_window: bool = False,
+    ) -> None:
+        self.app = app
+        self.kind = kind
+        self.progid = progid
+        self.pre_count = pre_count
+        self.default_with_window = with_window
+
+    @contextmanager
+    def open(
+        self,
+        file_path: str,
+        *,
+        read_only: bool = True,
+        with_window: bool | None = None,
+        backup: bool = False,
+        keep_backup: bool = False,
+    ) -> Iterator[tuple[Any, Any, dict[str, Any]]]:
+        info = inspect_container(file_path)
+        if info["kind"] != self.kind:
+            raise ValueError(
+                f"Batch session kind {self.kind!r} cannot open {info['kind']!r} file: {file_path}"
+            )
+        abs_path = info["path"]
+        if not read_only:
+            check_write_lock(abs_path)
+
+        backup_path = safe_backup(abs_path) if (backup and not read_only) else None
+        use_window = self.default_with_window if with_window is None else with_window
+        doc_obj = None
+        succeeded = False
+
+        try:
+            doc_obj = _open_com_document(
+                self.app, self.kind, abs_path, read_only=read_only, with_window=use_window
+            )
+            meta = {
+                "progid": self.progid,
+                "path": abs_path,
+                "container": info["container"],
+                "backup_path": backup_path,
+                "pre_count": self.pre_count,
+            }
+            yield self.app, doc_obj, meta
+            succeeded = True
+        finally:
+            _close_com_document(doc_obj, self.kind)
+            doc_obj = None
+
+            if not succeeded and backup_path and not read_only:
+                try:
+                    restore_backup(backup_path, abs_path)
+                except Exception:
+                    pass
+
+            if backup_path and not keep_backup and succeeded:
+                try:
+                    os.remove(backup_path)
+                except Exception:
+                    pass
+
+
+@contextmanager
+def wps_batch_session(
+    kind: str,
+    *,
+    with_window: bool = False,
+    preferred_progid: str | None = None,
+) -> Iterator[WPSBatchSession]:
+    """Keep a single WPS COM instance alive across multiple sequential file operations."""
+    if dyn is None:
+        raise RuntimeError("pywin32 (win32com.client.dynamic) is required on Windows.")
+
+    with com_thread_scope():
+        progid = resolve_progid(kind, preferred_progid=preferred_progid)
+        app = dyn.Dispatch(progid)
+        pre_count = _collection_count(app, kind)
+        target_visible: bool | None = None if pre_count > 0 else False
+        prev_state = _set_quiet(app, kind, visible=target_visible, alerts=False)
+        session = WPSBatchSession(app, kind, progid, pre_count, with_window=with_window)
+
+        try:
+            yield session
+        finally:
+            post_count = _collection_count(app, kind)
+            if pre_count == 0 and post_count == 0:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            else:
+                for k, v in prev_state.items():
+                    try:
+                        setattr(app, k, v)
+                    except Exception:
+                        pass
+            session.app = None
+            app = None
+            gc.collect()
+
+
+@contextmanager
 def wps_session(
     kind: str,
     file_path: str,
@@ -307,79 +477,120 @@ def wps_session(
     if not read_only:
         check_write_lock(abs_path)
 
-    backup_path = safe_backup(abs_path) if (backup and not read_only) else None
-    progid = resolve_progid(kind, preferred_progid=preferred_progid)
-    app = dyn.Dispatch(progid)
-    pre_count = _collection_count(app, kind)
+    with com_thread_scope():
+        backup_path = safe_backup(abs_path) if (backup and not read_only) else None
+        progid = resolve_progid(kind, preferred_progid=preferred_progid)
+        app = dyn.Dispatch(progid)
+        pre_count = _collection_count(app, kind)
 
-    # Preserve foreground user visibility if WPS already has open documents.
-    target_visible: bool | None = None if pre_count > 0 else False
-    prev_state = _set_quiet(app, kind, visible=target_visible, alerts=False)
-    doc_obj = None
-    succeeded = False
+        # Preserve foreground user visibility if WPS already has open documents.
+        target_visible: bool | None = None if pre_count > 0 else False
+        prev_state = _set_quiet(app, kind, visible=target_visible, alerts=False)
+        doc_obj = None
+        succeeded = False
 
-    try:
-        if kind == "word":
-            doc_obj = app.Documents.Open(abs_path, ReadOnly=read_only)
-        elif kind == "excel":
-            doc_obj = app.Workbooks.Open(abs_path, ReadOnly=read_only)
-        elif kind == "ppt":
-            doc_obj = app.Presentations.Open(
-                abs_path,
-                ReadOnly=-1 if read_only else 0,
-                Untitled=0,
-                WithWindow=-1 if with_window else 0,
+        try:
+            doc_obj = _open_com_document(
+                app, kind, abs_path, read_only=read_only, with_window=with_window
             )
-        else:
-            raise ValueError(f"Unknown kind: {kind!r}")
-
-        meta = {
-            "progid": progid,
-            "path": abs_path,
-            "container": info["container"],
-            "backup_path": backup_path,
-            "pre_count": pre_count,
-        }
-        yield app, doc_obj, meta
-        succeeded = True
-    finally:
-        if doc_obj is not None:
-            try:
-                if kind in ("word", "excel"):
-                    doc_obj.Close(SaveChanges=False)
-                else:
-                    doc_obj.Close()
-            except Exception:
-                pass
+            meta = {
+                "progid": progid,
+                "path": abs_path,
+                "container": info["container"],
+                "backup_path": backup_path,
+                "pre_count": pre_count,
+            }
+            yield app, doc_obj, meta
+            succeeded = True
+        finally:
+            _close_com_document(doc_obj, kind)
             doc_obj = None
 
-        if not succeeded and backup_path and not read_only:
-            try:
-                restore_backup(backup_path, abs_path)
-            except Exception:
-                pass
-
-        if backup_path and not keep_backup and succeeded:
-            try:
-                os.remove(backup_path)
-            except Exception:
-                pass
-
-        post_count = _collection_count(app, kind)
-        # Never quit an existing WPS process that already had open user/exam documents.
-        if pre_count == 0 and post_count == 0:
-            try:
-                app.Quit()
-            except Exception:
-                pass
-        else:
-            for k, v in prev_state.items():
+            if not succeeded and backup_path and not read_only:
                 try:
-                    setattr(app, k, v)
+                    restore_backup(backup_path, abs_path)
                 except Exception:
                     pass
-        app = None
-        gc.collect()
+
+            if backup_path and not keep_backup and succeeded:
+                try:
+                    os.remove(backup_path)
+                except Exception:
+                    pass
+
+            post_count = _collection_count(app, kind)
+            # Never quit an existing WPS process that already had open user/exam documents.
+            if pre_count == 0 and post_count == 0:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            else:
+                for k, v in prev_state.items():
+                    try:
+                        setattr(app, k, v)
+                    except Exception:
+                        pass
+            app = None
+            gc.collect()
+
+
+class COMWorkerQueue:
+    """Dedicated single-thread STA worker queue for serializing COM automation from GUI/web backends."""
+
+    _STOP = object()
+
+    def __init__(self, *, name: str = "wps-com-worker") -> None:
+        self._queue: queue.Queue[Any] = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._thread = threading.Thread(target=self._run, name=name, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        with com_thread_scope():
+            while True:
+                item = self._queue.get()
+                if item is self._STOP:
+                    self._queue.task_done()
+                    break
+                fn, args, kwargs, fut = item
+                try:
+                    if fut.set_running_or_notify_cancel():
+                        res = fn(*args, **kwargs)
+                        fut.set_result(res)
+                except BaseException as exc:  # pragma: no cover - propagated via Future
+                    try:
+                        fut.set_exception(exc)
+                    except Exception:
+                        pass
+                finally:
+                    self._queue.task_done()
+
+    def submit(self, fn: Callable[..., T], *args: Any, **kwargs: Any) -> Future[T]:
+        """Enqueue a callable to execute on the dedicated STA COM worker thread."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("COMWorkerQueue has already been shut down.")
+            fut: Future[T] = Future()
+            self._queue.put((fn, args, kwargs, fut))
+            return fut
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        """Stop accepting new tasks and shut down the worker thread cleanly."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self._queue.put(self._STOP)
+        if wait and self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join()
+
+    def __enter__(self) -> COMWorkerQueue:
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.shutdown(wait=True)
 
 
 def main() -> None:
