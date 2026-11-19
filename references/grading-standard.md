@@ -55,7 +55,7 @@ python scripts/ref_diff.py <作答文件> <参考答案>
 # 输出结构化 JSON 供脚本/评测前端消费
 python scripts/ref_diff.py <作答文件> <参考答案> --json
 
-# 仅跑纯 OOXML 对比（无需安装 WPS，毫秒级）
+# 仅跑纯 OOXML 维度对比（跳过文本/计算值/版式等 COM 维，无需安装 WPS，毫秒级）
 python scripts/ref_diff.py <作答文件> <参考答案> --no-com
 ```
 ### 方式 C：无参考答案时的 JSON 分值规则判分与批改（培训软件平替核心）
@@ -63,14 +63,23 @@ python scripts/ref_diff.py <作答文件> <参考答案> --no-com
 # 1) 按 JSON 规则文件打分（支持单文件分点计分）
 python scripts/rubric_grader.py grade <作答文件> examples/ppt_sample.rubric.json
 
-# 2) 从已有参考答案自动生成 JSON 评分规则草稿
+# 2) 从已有参考答案提取基础 JSON 评分规则骨架（需 WPS COM，自动生成最多 10 类结构/XML 规则）
 python scripts/rubric_grader.py init <参考答案> -o my_exam.rubric.json --total-points 20
 
 # 3) 整套模考目录批量自动判分（自动匹配 *.rubric.json 或 参考答案目录）
 python scripts/rubric_grader.py batch <作答目录> <参考答案或规则目录> --json
 ```
 
-#### 支持的 `rubric.json` 检查类型（`type`）速查
-- **Word**：`word_page_setup`、`word_style`、`word_paragraph_match`、`word_text_absent`、`word_header_watermark`、`word_numbering_xml`、`word_table`、`word_effects_xml`、`word_chart`
-- **Excel**：`excel_sheets`、`excel_range_formula`、`excel_range_values`、`excel_number_format`、`excel_conditional_formatting`、`excel_sort_state`、`excel_pivot_table`
-- **PPT**：`ppt_page_setup`、`ppt_print_options`、`ppt_master_background`、`ppt_slide_transition`、`ppt_shape_match`、`ppt_align_distribute`、`ppt_chart`
+#### 支持的 `rubric.json` 检查类型（`type`）速查（共 23 类，标注 `--no-com` 兼容度）
+- **Word (9)**：
+  - 纯 XML（支持 `--no-com`）：`word_numbering_xml`、`word_effects_xml`
+  - 混合（`--no-com` 仅核 XML 子项）：`word_page_setup`、`word_header_watermark`、`word_table`、`word_chart`
+  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`word_style`、`word_paragraph_match`、`word_text_absent`
+- **Excel (7)**：
+  - 纯 XML（支持 `--no-com`）：`excel_sheets`、`excel_sort_state`
+  - 混合（`--no-com` 仅核 XML 子项）：`excel_conditional_formatting`、`excel_pivot_table`
+  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`excel_range_formula`、`excel_range_values`、`excel_number_format`
+- **PPT (7)**：
+  - 纯 XML（支持 `--no-com`）：`ppt_print_options`
+  - 混合（`--no-com` 仅核 XML 子项）：`ppt_page_setup`、`ppt_shape_match`、`ppt_chart`
+  - 硬性依赖 COM（`--no-com` 直接判 `FAIL`）：`ppt_master_background`、`ppt_slide_transition`、`ppt_align_distribute`
