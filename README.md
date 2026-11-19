@@ -20,7 +20,7 @@
 ## 一、 环境要求与安装
 
 - **操作系统**：Windows 10 / 11
-- **办公软件**：WPS Office 完整版（建议 12.0+；已注册 `Kwpp.Application` / `Kwps.Application` / `Ket.Application` 或旧版 `WPP` / `WPS` / `ET` COM 接口；若仅使用 `--no-com` 纯 XML 审计可免装 WPS）
+- **办公软件**：WPS Office 完整版（建议 12.0+；已注册 `Kwpp.Application` / `Kwps.Application` / `Ket.Application` 或旧版 `WPP` / `WPS` / `ET` COM 接口；若仅用 `ooxml_patch.py` 或 `ref_diff.py --no-com` 做纯 XML 结构审计可免装 WPS）
 - **Python**：3.9+
 
 ### 安装依赖
@@ -91,14 +91,14 @@ python scripts/ref_diff.py path\to\作答文件.pptx path\to\参考答案.pptx
 # 输出结构化 JSON 供脚本或前端消费
 python scripts/ref_diff.py path\to\作答文件.xlsx path\to\参考答案.xlsx --json
 
-# 纯 OOXML 极速比对（免 WPS 进程，适合 CI/Linux 服务端批量预检）
+# 纯 OOXML 结构比对（免 WPS 进程，跳过文本/公式计算值/版式等 COM 维，适合 CI/Linux 预检）
 python scripts/ref_diff.py path\to\作答文件.docx path\to\参考答案.docx --no-com
 ```
 - 退出码：`0` 表示全部通过，`1` 表示存在差异。
 - 输出会精确指出失分位置（例如单元格 `E2` 公式不一致、条件格式行号偏移 `$B3` vs `$B2`、缺少 `anchorCtr="0"`、图表数据点 `<c:ptCount>` 不符等）。
 
 #### 场景 4：无参考答案（或需按分值权重算分）—— JSON 规则判分
-1. **根据已有参考答案一键生成规则模板**（也可参考 [examples/ppt_sample.rubric.json](examples/ppt_sample.rubric.json) 手写）：
+1. **根据已有参考答案一键生成规则骨架**（需 WPS COM；当前自动提取页面设置、工作表/条件格式/排序、表格、切换、打印与图表等 10 类基础规则，文本样式/公式值/图形定位规则需参考 [references/grading-standard.md](references/grading-standard.md) 补充，或参考 [examples/ppt_sample.rubric.json](examples/ppt_sample.rubric.json) 手写）：
    ```powershell
    python scripts/rubric_grader.py init path\to\参考答案.pptx -o my_exam.rubric.json --total-points 20
    ```
@@ -130,8 +130,9 @@ python scripts/rubric_grader.py batch path\to\作答目录 path\to\参考答案�
 ```text
 wps-exam-solver/
 ├── SKILL.md                   # Agent Skill 主指令：执行铁律与标准求解/自检骨架
+├── AGENTS.md                  # 维护本 Skill 源码的 Agent 入口规则、状态与优化清单
 ├── README.md                  # 项目说明、安装方式与完整 CLI/Agent 使用流程
-├── requirements.txt           # Python 依赖（pywin32 / python-docx / openpyxl）
+├── requirements.txt           # Python 依赖（pywin32 / python-docx；openpyxl 暂为预留依赖）
 ├── .gitignore                 # 忽略缓存、虚拟环境、临时锁文件（~$*）与备份文件
 ├── examples/
 │   └── ppt_sample.rubric.json # 加权分值评分规则示例
@@ -151,6 +152,6 @@ wps-exam-solver/
 
 ## 五、 已知边界
 
-1. **COM 层仅支持 Windows**：`pywin32` 与 WPS COM 调度要求 Windows 10/11 环境；部分绿色版/极简版若未注册 `Kwps`/`Ket`/`Kwpp`（或旧版 `WPS`/`ET`/`WPP`），将无法执行 COM 自动化，仅可使用 `--no-com` 进行 OOXML 审计。
+1. **COM 层仅支持 Windows**：`pywin32` 与 WPS COM 调度要求 Windows 10/11 环境；部分绿色版/极简版若未注册 `Kwps`/`Ket`/`Kwpp`（或旧版 `WPS`/`ET`/`WPP`），将无法执行 COM 自动化，仅可使用 `ooxml_patch.py`、`ref_diff.py --no-com` 及 `rubric_grader.py` 中纯 XML 规则做部分静态审计（23 类规则中有 9 类硬性依赖 COM，暂无法仅凭 `--no-com` 完成全量评分）。
 2. **旧版 OLE2 二进制文件**：非 ZIP 容器的传统二进制 `.doc` / `.xls` / `.wps` / `.et` 文件会自动跳过 OOXML 检查，仅走 COM 层面读写与对比。
 3. **当前适配范围为 WPS Office**：Microsoft Office（`Word.Application` / `Excel.Application` / `PowerPoint.Application`）在内建样式本地化名称、内核特性及二级 MS Office 考纲（如邮件合并、尾注/交叉引用、PPT 触发器时间轴等）上存在显著差异，暂未纳入默认适配。
